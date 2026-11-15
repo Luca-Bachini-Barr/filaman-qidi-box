@@ -34,7 +34,13 @@ BOX = {
         {"aht20_temp": 0, "aht20_humidity": 0},
     ],
 }
-FILAMENT = SimpleNamespace(diameter_mm=1.75, density_g_cm3=1.24)
+FILAMENT = SimpleNamespace(
+    diameter_mm=1.75,
+    density_g_cm3=1.24,
+    manufacturer=SimpleNamespace(name="Bambu Lab"),
+    designation="Matte Dark Green",
+    material_type="PLA",
+)
 
 
 def status(state="standby", used=0.0, loaded="slot16", empty=(1,), box=True, name="a.gcode"):
@@ -92,6 +98,8 @@ class World:
         self.status = status()
         self.objects = [f"box_stepper slot{slot}" for slot in range(4)] + ["extruder"]
         self.requests = []
+        self.scripts = []
+        self.fail_post = False
         monkeypatch.setattr(module, "async_session_maker", lambda: FakeSession(self))
         world = self
 
@@ -109,8 +117,9 @@ class World:
 
         monkeypatch.setattr(module, "SpoolService", Service)
 
-    def driver(self):
-        driver = Driver(3, {"moonraker_url": "http://printer:7125/"}, self.events.append)
+    def driver(self, **config):
+        config = {"moonraker_url": "http://printer:7125/", **config}
+        driver = Driver(3, config, self.events.append)
         world = self
 
         class Response:
@@ -131,6 +140,13 @@ class World:
                 if url.endswith("objects/list"):
                     return Response({"objects": world.objects})
                 return Response({"status": copy.deepcopy(world.status)})
+
+            async def post(self, url, json):
+                if world.fail_post:
+                    raise OSError("printer off")
+                assert url == "http://printer:7125/printer/gcode/script"
+                world.scripts.append(json["script"])
+                return Response("ok")
 
         driver._client = Client()
         return driver
@@ -832,3 +848,68 @@ def test_klipper_shutdown_freezes_the_slots_and_restarts_the_settle_time(
     world.status = slot_with("#F28636")
     run(driver._poll())
     assert driver._assigned == {0: 9}
+
+
+def test_assigning_a_spool_sets_the_slot_on_the_printer(world):
+    driver = world.driver()
+    run(driver._poll())
+    run(driver.send_filament_to_tray(0, 1, {"material_type": "PLA", "color": "68724d"}, spool_id=7))
+    assert world.scripts == [
+        "UPDATE_FILAMENT_INFORMATION SLOT=1 COLOR='68724D' VENDOR='Bambu' FILAMENT='PLA'"
+    ]
+    assert driver.health()["last_printer_update"] == {
+        "slot": "0-1", "spool_id": 7, "vendor": "Bambu", "filament": "PLA",
+        "color": "68724D", "ok": True,
+    }
+
+
+def test_slot_on_a_second_box_uses_its_global_number(world):
+    world.objects = [f"box_stepper slot{slot}" for slot in range(8)]
+    driver = world.driver()
+    run(driver._poll())
+    run(driver.send_filament_to_tray(1, 2, {"color": "FFFFFF"}, spool_id=7))
+    assert world.scripts[0].startswith("UPDATE_FILAMENT_INFORMATION SLOT=6 ")
+
+
+def test_printer_update_can_be_turned_off(world):
+    driver = world.driver(update_printer_slots=False)
+    run(driver._poll())
+    run(driver.send_filament_to_tray(0, 1, {"color": "68724D"}, spool_id=7))
+    assert world.scripts == []
+    assert driver._assigned == {1: 7}
+
+
+def test_no_printer_update_during_a_print(world):
+    driver = world.driver()
+    world.status = status(state="printing", used=10.0, loaded="slot0")
+    run(driver._poll())
+    run(driver.send_filament_to_tray(0, 1, {"color": "68724D"}, spool_id=7))
+    assert world.scripts == []
+    assert driver.health()["last_printer_update"]["skipped"] == "printing"
+
+
+@pytest.mark.parametrize("color", ["", "FFF", "zzzzzz"])
+def test_no_printer_update_without_a_colour(world, color):
+    driver = world.driver()
+    run(driver._poll())
+    run(driver.send_filament_to_tray(0, 1, {"color": color}, spool_id=7))
+    assert world.scripts == []
+
+
+def test_material_the_printer_lacks_is_left_alone(world):
+    world.spool = SimpleNamespace(id=7, filament=SimpleNamespace(
+        manufacturer=None, designation="Natural", material_type="PVA"))
+    driver = world.driver()
+    run(driver._poll())
+    run(driver.send_filament_to_tray(0, 1, {"color": "FFFFFF"}, spool_id=7))
+    assert world.scripts == []
+    assert driver.health()["last_printer_update"]["skipped"] == "material not on the printer"
+
+
+def test_failed_printer_update_keeps_the_assignment(world):
+    driver = world.driver()
+    run(driver._poll())
+    world.fail_post = True
+    run(driver.send_filament_to_tray(0, 1, {"color": "68724D"}, spool_id=7))
+    assert driver._assigned == {1: 7}
+    assert driver.health()["last_printer_update"]["error"] == "printer off"

@@ -2,7 +2,8 @@
 
 Nothing is installed on the printer. The driver reads the Box's slots and the
 running job from Moonraker, and charges filament to the spool assigned to the slot
-that was feeding it.
+that was feeding it. When a spool is assigned to a slot, it also sets that slot's
+colour and filament on the printer, as its touchscreen would.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from app.plugins.base import BaseDriver
 from app.services.spool_service import SpoolService
 from sqlalchemy import select
 
+from .catalog import match
 from .usage import Report, UsageTracker, length_to_grams, parse_slot
 
 logger = logging.getLogger(__name__)
@@ -111,6 +113,8 @@ class Driver(BaseDriver):
         self._retry: list[Report] = []
         self._emitted: dict[int, dict[str, Any]] | None = None
         self._unassigned_mm = 0.0
+        self._update_printer = config.get("update_printer_slots", True) is not False
+        self._last_printer_update: dict[str, Any] | None = None
 
     def validate_config(self) -> None:
         if not self._url.startswith(("http://", "https://")):
@@ -387,6 +391,54 @@ class Driver(BaseDriver):
             tray_color=filament["color"],
         )
         self._emit_slots(self._slots)
+        await self._update_printer_slot(slot, spool_id, filament["color"])
+
+    async def _update_printer_slot(self, slot: int, spool_id: int, color: str) -> None:
+        """Set the slot's colour and filament on the printer to match the spool.
+
+        Never fails the assignment: anything that goes wrong is logged and shown in
+        the driver's health.
+        """
+        if not self._update_printer or self._client is None:
+            return
+        result: dict[str, Any] = {"slot": _slot_index(slot), "spool_id": spool_id}
+        self._last_printer_update = result
+        if self._tracker.in_job:
+            result["skipped"] = "printing"
+            return
+        if not re.fullmatch(r"[0-9A-Fa-f]{6}", color):
+            result["skipped"] = "no colour"
+            return
+        async with async_session_maker() as db:
+            spool = await SpoolService(db).get_spool(spool_id)
+        filament = getattr(spool, "filament", None)
+        manufacturer = getattr(getattr(filament, "manufacturer", None), "name", "") or ""
+        found = match(
+            manufacturer,
+            str(getattr(filament, "designation", "") or ""),
+            str(getattr(filament, "material_type", "") or ""),
+        )
+        if found is None:
+            result["skipped"] = "material not on the printer"
+            logger.info("No printer filament for spool %s, %s left as it is", spool_id, _slot_name(slot))
+            return
+        vendor, name = found
+        result.update(vendor=vendor, filament=name, color=color.upper())
+        script = (
+            f"UPDATE_FILAMENT_INFORMATION SLOT={slot} COLOR='{color.upper()}' "
+            f"VENDOR='{vendor}' FILAMENT='{name}'"
+        )
+        try:
+            response = await self._client.post(
+                self._url + "/printer/gcode/script", json={"script": script}
+            )
+            response.raise_for_status()
+        except Exception as err:  # the assignment itself already succeeded
+            result["error"] = str(err) or type(err).__name__
+            logger.warning("Couldn't set %s on the printer: %s", _slot_name(slot), result["error"])
+            return
+        result["ok"] = True
+        logger.info("Set %s on the printer to %s %s #%s", _slot_name(slot), vendor, name, color.upper())
 
     # ------------------------------------------------------------------ #
     # Charging spools                                                     #
@@ -479,6 +531,7 @@ class Driver(BaseDriver):
             "reports_waiting": len(self._retry),
             "last_error": self._last_error,
             "last_success_at": self._last_success_at,
+            "last_printer_update": self._last_printer_update,
         }
 
     async def get_display_state(self) -> dict[str, Any] | None:
