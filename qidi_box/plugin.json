@@ -3,7 +3,7 @@
   "name": "QIDI Box",
   "driver_key": "qidi_box",
   "plugin_type": "driver",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Tracks filament per QIDI Box slot on Moonraker printers such as the Q2. Charges each spool for what its slot used. Nothing is installed on the printer.",
   "author": "Luca-Bachini-Barr",
   "homepage": "https://github.com/Luca-Bachini-Barr/filaman-qidi-box",

@@ -10,6 +10,8 @@ A [FilaMan](https://github.com/Fire-Devils/filaman-system) printer driver for th
 - Lets you assign a FilaMan spool to each slot from the spool's page. Assigning a spool to a new slot releases it from its old one.
 - During a print, follows `box_extras.loaded_slot` and charges the net filament used to that slot's spool.
 - Releases a slot's spool after it has read empty for 30 seconds with no print running, so a swapped spool can't be charged for the old one's filament.
+- Restores that spool if the slot refills with the same filament, going by the colour, material and filament code on the printer. So an eject and reload needs no reassigning. If you select a different filament on the printer's screen within 10 minutes, the spool is released again.
+- Ignores the Box's filament details for a minute after the printer or Box powers up, because it first reports default filament for every slot.
 - Feeds FilaMan's AMS View with the Box's slots, temperature and humidity.
 
 ## How usage is counted
@@ -23,6 +25,9 @@ The figures come from `print_stats.filament_used`, converted to grams with the f
 
 ## Limitations
 
+- **Two spools of identical filament:** the driver can't tell them apart, so swapping one for the other in a slot keeps charging the first. Assign the right spool on its page when you swap them.
+- **Changing a restored slot's filament after 10 minutes:** the driver only watches for a different filament for 10 minutes after restoring a spool. A change on the printer's screen after that keeps the old spool assigned, so assign the right one on its page.
+- **FilaMan restarting while a slot is empty:** the spool waiting to be restored is forgotten, so you'd assign it again by hand.
 - **FilaMan restarting mid-print:** usage since its last report (up to about 700 mm, or 2 g) is lost, and the driver carries on from the current reading.
 - **Filament left below the cutter** at each change isn't counted, as the printer doesn't report it.
 - **Moving a spool in FilaMan:** the driver doesn't change a spool's FilaMan location.
