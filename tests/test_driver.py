@@ -43,7 +43,7 @@ def status(state="standby", used=0.0, loaded="slot16", empty=(1,), box=True, nam
             "filament_used": used,
             "print_duration": used,
         },
-        "box_extras": {**BOX, "loaded_slot": loaded} if box else None,
+        "box_extras": {**copy.deepcopy(BOX), "loaded_slot": loaded} if box else None,
     }
     for slot in range(4):
         data[f"box_stepper slot{slot}"] = {"runout_button": int(slot in empty)}
@@ -487,3 +487,160 @@ def test_another_spool_stays_where_it_is(world):
     run(driver.send_filament_to_tray(0, 2, filament, spool_id=64))
     run(driver.send_filament_to_tray(0, 3, filament, spool_id=1))
     assert driver._assigned == {2: 64, 3: 1}
+
+
+def slot_with(color, filament_id="QFA00", empty=()):
+    data = status(empty=empty)
+    info = data["box_extras"]["boxes"][0]["filament_info"][0]
+    info["color_rgb_str"] = [color]
+    info["filament_id"] = filament_id
+    return data
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: now[0])
+    return now
+
+
+def emptied_slot(world, clock):
+    """Return a driver whose slot 0 had spool 9, then stayed empty until released."""
+    driver = world.driver()
+    driver._assigned = {0: 9}
+    world.status = slot_with("#F28636")
+    run(driver._poll())
+    world.status = slot_with("#F28636", empty=(0,))
+    run(driver._poll())
+    clock[0] += module.RELEASE_AFTER_SECONDS
+    run(driver._poll())
+    assert driver._assigned == {}
+    assert driver.health()["remembered_slot_spools"] == {"0-0": 9}
+    return driver
+
+
+def test_same_filament_back_restores_the_spool(world, clock):
+    driver = emptied_slot(world, clock)
+    world.status = slot_with("#f28636")
+    run(driver._poll())
+    assert driver._assigned == {0: 9}
+    assert world.events[-1]["slots"][0]["spool_id"] == 9
+    assert driver.health()["remembered_slot_spools"] == {}
+
+
+def test_restored_spool_keeps_its_assigned_colour(world, clock):
+    driver = world.driver()
+    run(driver._poll())
+    run(driver.send_filament_to_tray(0, 0, {"material_type": "PLA", "color": "FF9016"}, 49))
+    run(driver._poll())
+    world.status = status(empty=(0,))
+    run(driver._poll())
+    clock[0] += module.RELEASE_AFTER_SECONDS
+    run(driver._poll())
+    assert world.events[-1]["slots"][0]["spool_id"] is None
+    world.status = status(empty=())
+    run(driver._poll())
+    assert world.events[-1]["slots"][0]["spool_id"] == 49
+    assert world.events[-1]["slots"][0]["tray_color"] == "FF9016"
+
+
+@pytest.mark.parametrize(
+    "different",
+    [("#111111", "QFA00"), ("#F28636", "QFA90")],
+)
+def test_different_filament_stays_unassigned(world, clock, different):
+    driver = emptied_slot(world, clock)
+    world.status = slot_with(*different)
+    run(driver._poll())
+    assert driver._assigned == {}
+    # It's forgotten, even if the first filament returns later.
+    world.status = slot_with("#F28636")
+    run(driver._poll())
+    assert driver._assigned == {}
+
+
+def test_filament_selected_after_reload_releases_the_spool(world, clock):
+    """Filament goes in first and is selected second, so the restore can be wrong."""
+    driver = emptied_slot(world, clock)
+    world.status = slot_with("#F28636")
+    run(driver._poll())
+    assert driver._assigned == {0: 9}
+
+    clock[0] += module.RESTORE_WATCH_SECONDS - 1
+    world.status = slot_with("#111111")
+    run(driver._poll())
+    assert driver._assigned == {}
+    assert driver.health()["remembered_slot_spools"] == {}
+    assert world.events[-1]["slots"][0]["spool_id"] is None
+
+
+def test_filament_edited_after_the_watch_keeps_the_spool(world, clock):
+    driver = emptied_slot(world, clock)
+    world.status = slot_with("#F28636")
+    run(driver._poll())
+    clock[0] += module.RESTORE_WATCH_SECONDS
+    world.status = slot_with("#111111")
+    run(driver._poll())
+    assert driver._assigned == {0: 9}
+
+
+def test_explicit_assignment_ignores_filament_edits(world, clock):
+    """Correcting a colour on the printer must not drop a spool you assigned."""
+    driver = world.driver()
+    driver._assigned = {0: 9}
+    world.status = slot_with("#F28636")
+    run(driver._poll())
+    world.status = slot_with("#111111")
+    run(driver._poll())
+    assert driver._assigned == {0: 9}
+
+
+def test_filament_change_during_a_print_keeps_the_spool(world, clock):
+    driver = emptied_slot(world, clock)
+    world.status = slot_with("#F28636")
+    run(driver._poll())
+    world.status = slot_with("#111111")
+    world.status["print_stats"]["state"] = "printing"
+    run(driver._poll())
+    assert driver._assigned == {0: 9}
+
+
+def test_spool_assigned_elsewhere_is_not_restored(world, clock):
+    driver = emptied_slot(world, clock)
+    run(driver.send_filament_to_tray(0, 2, {"color": "000000"}, spool_id=9))
+    assert driver.health()["remembered_slot_spools"] == {}
+    world.status = slot_with("#F28636")
+    run(driver._poll())
+    assert driver._assigned == {2: 9}
+
+
+def test_new_assignment_to_the_slot_replaces_the_memory(world, clock):
+    driver = emptied_slot(world, clock)
+    world.status = slot_with("#F28636", empty=(0,))
+    run(driver.send_filament_to_tray(0, 0, {"color": "000000"}, spool_id=5))
+    assert driver.health()["remembered_slot_spools"] == {}
+    world.status = slot_with("#F28636")
+    run(driver._poll())
+    assert driver._assigned == {0: 5}
+
+
+def test_memory_skips_a_spool_now_used_elsewhere(world, clock):
+    driver = emptied_slot(world, clock)
+    driver._assigned[2] = 9
+    world.status = slot_with("#F28636")
+    run(driver._poll())
+    assert driver._assigned == {2: 9}
+
+
+def test_slot_without_filament_details_has_no_memory(world, clock):
+    driver = world.driver()
+    driver._assigned = {0: 9}
+    world.status = status()
+    world.status["box_extras"]["boxes"][0]["filament_info"] = []
+    run(driver._poll())
+    world.status = status(empty=(0,))
+    run(driver._poll())
+    clock[0] += module.RELEASE_AFTER_SECONDS
+    run(driver._poll())
+    assert driver._assigned == {}
+    assert driver.health()["remembered_slot_spools"] == {}

@@ -33,6 +33,9 @@ IDLE_POLL_SECONDS = 10.0
 # A slot must read empty this long, with no print running, before its spool is
 # released. A swapped spool then can't be charged for the old one's filament.
 RELEASE_AFTER_SECONDS = 30.0
+# You insert filament before selecting it on the printer's screen, so a restored
+# spool stays on trial for this long in case the slot's filament then changes.
+RESTORE_WATCH_SECONDS = 600.0
 SLOTS_PER_BOX = 4
 STEPPER_RE = re.compile(r"^box_stepper slot(\d+)$")
 
@@ -62,6 +65,14 @@ def _box_color(filament: dict[str, Any]) -> str:
     return ""
 
 
+def _box_identity(filament: dict[str, Any]) -> tuple[str, str, str] | None:
+    """Return what identifies a slot's filament, or None if the Box doesn't say."""
+    color = _box_color(filament).lower()
+    if not color:
+        return None
+    return (color, str(filament.get("filament_type") or ""), str(filament.get("filament_id") or ""))
+
+
 class Driver(BaseDriver):
     driver_key = "qidi_box"
 
@@ -84,6 +95,11 @@ class Driver(BaseDriver):
         self._assigned: dict[int, int] = {}
         self._assigned_filament: dict[int, dict[str, str]] = {}
         self._empty_since: dict[int, float] = {}
+        # What the Box says is in each assigned slot, what to restore if that comes
+        # back, and when a slot's spool was last restored.
+        self._identity: dict[int, tuple[str, str, str]] = {}
+        self._remembered: dict[int, tuple[int, tuple[str, str, str], dict[str, str]]] = {}
+        self._restored_at: dict[int, float] = {}
         self._retry: list[Report] = []
         self._emitted: dict[int, dict[str, Any]] | None = None
         self._unassigned_mm = 0.0
@@ -185,13 +201,22 @@ class Driver(BaseDriver):
             stepper = status.get(f"box_stepper slot{slot}") or {}
             present = stepper.get("runout_button") != 1
 
+            if present:
+                self._track_identity(slot, _box_identity(_box_filament(status, slot)), now)
+
             if present or self._tracker.in_job or slot not in self._assigned:
                 self._empty_since.pop(slot, None)
             elif now - self._empty_since.setdefault(slot, now) >= RELEASE_AFTER_SECONDS:
                 logger.info("Releasing spool from empty slot %s", _slot_name(slot))
                 self._empty_since.pop(slot, None)
-                del self._assigned[slot]
-                self._assigned_filament.pop(slot, None)
+                identity = self._identity.get(slot)
+                if identity:
+                    self._remembered[slot] = (
+                        self._assigned[slot],
+                        identity,
+                        self._assigned_filament.get(slot, {}),
+                    )
+                self._release(slot)
 
             assigned = self._assigned_filament.get(slot, {})
             box_filament = _box_filament(status, slot) if present else {}
@@ -213,6 +238,38 @@ class Driver(BaseDriver):
         # Emit only changes: an event means database writes in FilaMan.
         if slots != self._emitted:
             self._emit_slots(slots)
+
+    def _track_identity(self, slot: int, identity: tuple[str, str, str] | None, now: float) -> None:
+        """Follow a loaded slot's filament, restoring or releasing its spool."""
+        if slot in self._assigned:
+            restored_at = self._restored_at.get(slot)
+            if restored_at is not None and now - restored_at >= RESTORE_WATCH_SECONDS:
+                del self._restored_at[slot]
+                restored_at = None
+            if (
+                restored_at is not None
+                and identity
+                and identity != self._identity.get(slot)
+                and not self._tracker.in_job
+            ):
+                logger.info("Filament changed in %s, releasing its spool", _slot_name(slot))
+                self._release(slot)
+            elif identity:
+                self._identity[slot] = identity
+        elif slot in self._remembered:
+            spool_id, remembered, filament = self._remembered.pop(slot)
+            if identity == remembered and spool_id not in self._assigned.values():
+                logger.info("Same filament back in %s, restoring its spool", _slot_name(slot))
+                self._assigned[slot] = spool_id
+                self._assigned_filament[slot] = filament
+                self._identity[slot] = remembered
+                self._restored_at[slot] = now
+
+    def _release(self, slot: int) -> None:
+        del self._assigned[slot]
+        self._assigned_filament.pop(slot, None)
+        self._identity.pop(slot, None)
+        self._restored_at.pop(slot, None)
 
     def _emit_slots(self, slots: dict[int, dict[str, Any]]) -> None:
         self._emitted = {slot: dict(data) for slot, data in slots.items()}
@@ -262,10 +319,15 @@ class Driver(BaseDriver):
         }
         # A spool can only be in one place, so it leaves any slot it was in before.
         for other in [s for s, spool in self._assigned.items() if spool == spool_id and s != slot]:
-            del self._assigned[other]
-            self._assigned_filament.pop(other, None)
+            self._release(other)
             if other in self._slots:
                 self._slots[other].update(spool_id=None, tray_type="", tray_color="")
+        # A deliberate choice replaces anything waiting to be restored.
+        self._remembered = {
+            s: entry for s, entry in self._remembered.items() if s != slot and entry[0] != spool_id
+        }
+        self._identity.pop(slot, None)
+        self._restored_at.pop(slot, None)
         self._assigned[slot] = spool_id
         self._assigned_filament[slot] = filament
         self._empty_since.pop(slot, None)
@@ -357,6 +419,9 @@ class Driver(BaseDriver):
             "slot_count": len(self._slots),
             "tracked_slot_spools": {
                 _slot_index(slot): spool for slot, spool in self._assigned.items()
+            },
+            "remembered_slot_spools": {
+                _slot_index(slot): entry[0] for slot, entry in self._remembered.items()
             },
             "net_mm": {_slot_index(s): round(v, 1) for s, v in self._tracker.net_mm.items()},
             "unassigned_mm": round(self._unassigned_mm, 1),
