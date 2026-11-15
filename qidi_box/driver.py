@@ -106,6 +106,7 @@ class Driver(BaseDriver):
         self._identity: dict[int, tuple[str, str, str]] = {}
         self._remembered: dict[int, tuple[int, tuple[str, str, str], dict[str, str]]] = {}
         self._restored_at: dict[int, float] = {}
+        self._changed_in_job: set[int] = set()
         self._box_up_since: float | None = None
         self._retry: list[Report] = []
         self._emitted: dict[int, dict[str, Any]] | None = None
@@ -174,6 +175,7 @@ class Driver(BaseDriver):
         query = [
             "print_stats=state,filename,filament_used,print_duration",
             "box_extras",
+            "webhooks=state",
         ]
         query += [quote(f"box_stepper slot{slot}") for slot in self._steppers]
         result = await self._get("/printer/objects/query?" + "&".join(query))
@@ -197,8 +199,10 @@ class Driver(BaseDriver):
         await self._send_reports(self._retry + reports)
 
         # Without its Box the printer still holds the last filaments, which must
-        # not look like loaded spools or release anything.
-        if box:
+        # not look like loaded spools or release anything. When the Box loses
+        # power, Klipper shuts down and Moonraker keeps serving its last readings.
+        klipper_ready = (status.get("webhooks") or {}).get("state", "ready") == "ready"
+        if box and klipper_ready:
             await self._update_slots(status)
         else:
             self._box_up_since = None
@@ -260,24 +264,38 @@ class Driver(BaseDriver):
             return
         if slot in self._assigned:
             restored_at = self._restored_at.get(slot)
-            if restored_at is not None and now - restored_at >= RESTORE_WATCH_SECONDS:
+            # A change seen during a print within the watch keeps the watch open,
+            # so the spool is still released once the print ends.
+            if (
+                restored_at is not None
+                and now - restored_at >= RESTORE_WATCH_SECONDS
+                and slot not in self._changed_in_job
+            ):
                 del self._restored_at[slot]
                 restored_at = None
             if restored_at is not None and identity != self._identity.get(slot):
-                # During a print the old filament is kept, so the change is
-                # still caught once the print ends.
-                if not self._tracker.in_job:
+                if self._tracker.in_job:
+                    self._changed_in_job.add(slot)
+                else:
                     logger.info("Filament changed in %s, releasing its spool", _slot_name(slot))
                     self._release(slot)
             else:
                 self._identity[slot] = identity
+                self._changed_in_job.discard(slot)
         elif slot in self._remembered:
-            spool_id, remembered, filament = self._remembered.pop(slot)
-            if (
+            entry = self._remembered[slot]
+            spool_id, remembered, filament = entry
+            # If the lookup fails, the memory stays for the next poll.
+            restore = (
                 identity == remembered
                 and spool_id not in self._assigned.values()
                 and not await self._assigned_elsewhere(spool_id, slot)
-            ):
+            )
+            # A spool assigned by hand during the lookup has replaced the memory.
+            if self._remembered.get(slot) is not entry:
+                return
+            del self._remembered[slot]
+            if restore and slot not in self._assigned and spool_id not in self._assigned.values():
                 logger.info("Same filament back in %s, restoring its spool", _slot_name(slot))
                 self._assigned[slot] = spool_id
                 self._assigned_filament[slot] = filament
@@ -289,6 +307,7 @@ class Driver(BaseDriver):
         self._assigned_filament.pop(slot, None)
         self._identity.pop(slot, None)
         self._restored_at.pop(slot, None)
+        self._changed_in_job.discard(slot)
 
     def _emit_slots(self, slots: dict[int, dict[str, Any]]) -> None:
         self._emitted = {slot: dict(data) for slot, data in slots.items()}
@@ -357,6 +376,7 @@ class Driver(BaseDriver):
         }
         self._identity.pop(slot, None)
         self._restored_at.pop(slot, None)
+        self._changed_in_job.discard(slot)
         self._assigned[slot] = spool_id
         self._assigned_filament[slot] = filament
         self._empty_since.pop(slot, None)

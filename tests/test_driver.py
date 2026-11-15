@@ -739,8 +739,96 @@ def test_box_defaults_after_power_up_are_ignored(world, clock, monkeypatch):
 def test_box_missing_restarts_the_settle_time(world, clock, monkeypatch):
     driver = emptied_slot(world, clock)
     monkeypatch.setattr(module, "SETTLE_SECONDS", 60.0)
+    clock[0] += 61  # long settled before the Box goes missing
     world.status = status(box=False)
     run(driver._poll())
     world.status = slot_with("#FAFAFA")
     run(driver._poll())
     assert driver.health()["remembered_slot_spools"] == {"0-0": 9}
+    clock[0] += 60
+    world.status = slot_with("#F28636")
+    run(driver._poll())
+    assert driver._assigned == {0: 9}
+
+
+def test_change_in_a_print_longer_than_the_watch_still_releases(world, clock):
+    driver = emptied_slot(world, clock)
+    world.status = slot_with("#F28636")
+    run(driver._poll())
+    world.status = slot_with("#111111")
+    world.status["print_stats"]["state"] = "printing"
+    run(driver._poll())
+    clock[0] += module.RESTORE_WATCH_SECONDS + 60
+    run(driver._poll())
+    assert driver._assigned == {0: 9}
+    world.status = slot_with("#111111")
+    run(driver._poll())
+    assert driver._assigned == {}
+
+
+def test_change_reverted_during_the_print_keeps_the_spool(world, clock):
+    driver = emptied_slot(world, clock)
+    world.status = slot_with("#F28636")
+    run(driver._poll())
+    world.status = slot_with("#111111")
+    world.status["print_stats"]["state"] = "printing"
+    run(driver._poll())
+    world.status = slot_with("#F28636")
+    world.status["print_stats"]["state"] = "printing"
+    run(driver._poll())
+    clock[0] += module.RESTORE_WATCH_SECONDS
+    world.status = slot_with("#111111")
+    run(driver._poll())
+    assert driver._assigned == {0: 9}
+
+
+def test_failed_lookup_keeps_the_memory(world, clock):
+    driver = emptied_slot(world, clock)
+
+    async def broken(*_args):
+        raise RuntimeError("database busy")
+
+    driver._assigned_elsewhere = broken
+    world.status = slot_with("#F28636")
+    with pytest.raises(RuntimeError):
+        run(driver._poll())
+    assert driver.health()["remembered_slot_spools"] == {"0-0": 9}
+    del driver._assigned_elsewhere  # back to the real lookup
+    run(driver._poll())
+    assert driver._assigned == {0: 9}
+
+
+def test_assignment_during_the_lookup_wins(world, clock, monkeypatch):
+    driver = emptied_slot(world, clock)
+
+    async def assign_meanwhile(*_args):
+        await driver.send_filament_to_tray(0, 0, {"color": "000000"}, spool_id=5)
+        return False
+
+    monkeypatch.setattr(driver, "_assigned_elsewhere", assign_meanwhile)
+    world.status = slot_with("#F28636")
+    run(driver._poll())
+    assert driver._assigned == {0: 5}
+    assert driver.health()["remembered_slot_spools"] == {}
+
+
+def test_klipper_shutdown_freezes_the_slots_and_restarts_the_settle_time(
+    world, clock, monkeypatch
+):
+    """With the Box unpowered, Klipper shuts down and Moonraker serves stale data."""
+    driver = emptied_slot(world, clock)
+    events = len(world.events)
+    monkeypatch.setattr(module, "SETTLE_SECONDS", 60.0)
+    clock[0] += 61
+    world.status = slot_with("#FAFAFA")
+    world.status["webhooks"] = {"state": "shutdown"}
+    clock[0] += module.RELEASE_AFTER_SECONDS
+    run(driver._poll())
+    assert len(world.events) == events
+    world.status = slot_with("#FAFAFA")
+    run(driver._poll())
+    assert driver.health()["remembered_slot_spools"] == {"0-0": 9}
+    clock[0] += 60
+    world.status = slot_with("#F28636")
+    run(driver._poll())
+    assert driver._assigned == {0: 9}
