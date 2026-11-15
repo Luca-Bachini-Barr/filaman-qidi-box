@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import sys
 from types import SimpleNamespace
@@ -16,6 +17,7 @@ FILAMENT_INFO = [
     {
         "filament_type": "PLA",
         "filament_str": "PLA Basic",
+        "filament_id": "QFA00",
         "color_rgb_str": [color],
         "min_temp": 190,
         "max_temp": 240,
@@ -499,8 +501,10 @@ def slot_with(color, filament_id="QFA00", empty=()):
 
 @pytest.fixture
 def clock(monkeypatch):
+    """A clock the test moves, with the Box already settled after power-up."""
     now = [1000.0]
     monkeypatch.setattr(module.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(module, "SETTLE_SECONDS", 0.0)
     return now
 
 
@@ -644,3 +648,99 @@ def test_slot_without_filament_details_has_no_memory(world, clock):
     run(driver._poll())
     assert driver._assigned == {}
     assert driver.health()["remembered_slot_spools"] == {}
+
+
+def test_filament_change_during_a_print_releases_once_it_ends(world, clock):
+    driver = emptied_slot(world, clock)
+    world.status = slot_with("#F28636")
+    run(driver._poll())
+    world.status = slot_with("#111111")
+    world.status["print_stats"]["state"] = "printing"
+    run(driver._poll())
+    assert driver._assigned == {0: 9}
+    world.status = slot_with("#111111")
+    run(driver._poll())
+    assert driver._assigned == {}
+
+
+def test_spool_held_by_another_printer_is_not_restored(world, clock):
+    driver = emptied_slot(world, clock)
+    world.assignments = {5: 9}  # FilaMan has spool 9 elsewhere
+    world.status = slot_with("#F28636")
+    run(driver._poll())
+    assert driver._assigned == {}
+    assert driver.health()["remembered_slot_spools"] == {}
+
+
+def test_spool_still_recorded_in_its_own_slot_is_restored(world, clock, monkeypatch):
+    driver = emptied_slot(world, clock)
+    monkeypatch.setattr(FakeResult, "all", lambda self: [(3, 0)])
+    world.status = slot_with("#F28636")
+    run(driver._poll())
+    assert driver._assigned == {0: 9}
+
+
+@pytest.mark.parametrize("field", ["filament_type", "filament_id"])
+def test_partial_filament_details_are_not_an_identity(field):
+    filament = {"color_rgb_str": ["#F28636"], "filament_type": "PLA", "filament_id": "QFA00"}
+    assert module._box_identity(filament) == ("f28636", "PLA", "QFA00")
+    filament[field] = ""
+    assert module._box_identity(filament) is None
+
+
+def test_unreadable_filament_keeps_the_memory(world, clock):
+    driver = emptied_slot(world, clock)
+    world.status = slot_with("#F28636", filament_id="")
+    run(driver._poll())
+    assert driver.health()["remembered_slot_spools"] == {"0-0": 9}
+    world.status = slot_with("#F28636")
+    run(driver._poll())
+    assert driver._assigned == {0: 9}
+
+
+REAL_MONOTONIC = module.time.monotonic
+
+
+async def poll_loop_once(driver, monkeypatch):
+    """Let the run loop poll a few times, then stop it.
+
+    asyncio needs the real clock, so the test's clock stops while it runs.
+    """
+    fake = module.time.monotonic
+    monkeypatch.setattr(module.time, "monotonic", REAL_MONOTONIC)
+    monkeypatch.setattr(module, "IDLE_POLL_SECONDS", 0)
+    driver._running = True
+    task = asyncio.create_task(driver._run())
+    await asyncio.sleep(0.01)
+    driver._running = False
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    monkeypatch.setattr(module.time, "monotonic", fake)
+
+
+def test_box_defaults_after_power_up_are_ignored(world, clock, monkeypatch):
+    """After power-up the Box reports default filament before its real settings."""
+    driver = emptied_slot(world, clock)
+    monkeypatch.setattr(module, "SETTLE_SECONDS", 60.0)
+    world.status = None  # printer off
+    run(poll_loop_once(driver, monkeypatch))
+    world.status = slot_with("#FAFAFA")
+    run(driver._poll())
+    clock[0] += 59
+    run(driver._poll())
+    assert driver.health()["remembered_slot_spools"] == {"0-0": 9}
+    clock[0] += 1
+    world.status = slot_with("#F28636")
+    run(driver._poll())
+    assert driver._assigned == {0: 9}
+
+
+def test_box_missing_restarts_the_settle_time(world, clock, monkeypatch):
+    driver = emptied_slot(world, clock)
+    monkeypatch.setattr(module, "SETTLE_SECONDS", 60.0)
+    world.status = status(box=False)
+    run(driver._poll())
+    world.status = slot_with("#FAFAFA")
+    run(driver._poll())
+    assert driver.health()["remembered_slot_spools"] == {"0-0": 9}

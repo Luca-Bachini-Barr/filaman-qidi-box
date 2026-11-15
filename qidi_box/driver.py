@@ -36,6 +36,10 @@ RELEASE_AFTER_SECONDS = 30.0
 # You insert filament before selecting it on the printer's screen, so a restored
 # spool stays on trial for this long in case the slot's filament then changes.
 RESTORE_WATCH_SECONDS = 600.0
+# Just after the printer starts, the Box reports default filament for every
+# slot, and empty slots as loaded (about 6 seconds on a Q2). Filament details
+# are ignored for this long after the printer or Box comes back.
+SETTLE_SECONDS = 60.0
 SLOTS_PER_BOX = 4
 STEPPER_RE = re.compile(r"^box_stepper slot(\d+)$")
 
@@ -66,11 +70,13 @@ def _box_color(filament: dict[str, Any]) -> str:
 
 
 def _box_identity(filament: dict[str, Any]) -> tuple[str, str, str] | None:
-    """Return what identifies a slot's filament, or None if the Box doesn't say."""
-    color = _box_color(filament).lower()
-    if not color:
-        return None
-    return (color, str(filament.get("filament_type") or ""), str(filament.get("filament_id") or ""))
+    """Return what identifies a slot's filament, or None if the Box doesn't say it all."""
+    identity = (
+        _box_color(filament).lower(),
+        str(filament.get("filament_type") or ""),
+        str(filament.get("filament_id") or ""),
+    )
+    return identity if all(identity) else None
 
 
 class Driver(BaseDriver):
@@ -100,6 +106,7 @@ class Driver(BaseDriver):
         self._identity: dict[int, tuple[str, str, str]] = {}
         self._remembered: dict[int, tuple[int, tuple[str, str, str], dict[str, str]]] = {}
         self._restored_at: dict[int, float] = {}
+        self._box_up_since: float | None = None
         self._retry: list[Report] = []
         self._emitted: dict[int, dict[str, Any]] | None = None
         self._unassigned_mm = 0.0
@@ -143,6 +150,7 @@ class Driver(BaseDriver):
                 self._connected = False
                 self._last_error = message
                 self._steppers = []
+                self._box_up_since = None
             printing = self._tracker.in_job
             await asyncio.sleep(PRINT_POLL_SECONDS if printing else IDLE_POLL_SECONDS)
 
@@ -192,17 +200,22 @@ class Driver(BaseDriver):
         # not look like loaded spools or release anything.
         if box:
             await self._update_slots(status)
+        else:
+            self._box_up_since = None
 
     async def _update_slots(self, status: dict[str, Any]) -> None:
         now = time.monotonic()
+        if self._box_up_since is None:
+            self._box_up_since = now
+        settled = now - self._box_up_since >= SETTLE_SECONDS
         slots: dict[int, dict[str, Any]] = {}
 
         for slot in self._steppers:
             stepper = status.get(f"box_stepper slot{slot}") or {}
             present = stepper.get("runout_button") != 1
 
-            if present:
-                self._track_identity(slot, _box_identity(_box_filament(status, slot)), now)
+            if present and settled:
+                await self._track_identity(slot, _box_identity(_box_filament(status, slot)), now)
 
             if present or self._tracker.in_job or slot not in self._assigned:
                 self._empty_since.pop(slot, None)
@@ -239,26 +252,32 @@ class Driver(BaseDriver):
         if slots != self._emitted:
             self._emit_slots(slots)
 
-    def _track_identity(self, slot: int, identity: tuple[str, str, str] | None, now: float) -> None:
+    async def _track_identity(
+        self, slot: int, identity: tuple[str, str, str] | None, now: float
+    ) -> None:
         """Follow a loaded slot's filament, restoring or releasing its spool."""
+        if identity is None:
+            return
         if slot in self._assigned:
             restored_at = self._restored_at.get(slot)
             if restored_at is not None and now - restored_at >= RESTORE_WATCH_SECONDS:
                 del self._restored_at[slot]
                 restored_at = None
-            if (
-                restored_at is not None
-                and identity
-                and identity != self._identity.get(slot)
-                and not self._tracker.in_job
-            ):
-                logger.info("Filament changed in %s, releasing its spool", _slot_name(slot))
-                self._release(slot)
-            elif identity:
+            if restored_at is not None and identity != self._identity.get(slot):
+                # During a print the old filament is kept, so the change is
+                # still caught once the print ends.
+                if not self._tracker.in_job:
+                    logger.info("Filament changed in %s, releasing its spool", _slot_name(slot))
+                    self._release(slot)
+            else:
                 self._identity[slot] = identity
         elif slot in self._remembered:
             spool_id, remembered, filament = self._remembered.pop(slot)
-            if identity == remembered and spool_id not in self._assigned.values():
+            if (
+                identity == remembered
+                and spool_id not in self._assigned.values()
+                and not await self._assigned_elsewhere(spool_id, slot)
+            ):
                 logger.info("Same filament back in %s, restoring its spool", _slot_name(slot))
                 self._assigned[slot] = spool_id
                 self._assigned_filament[slot] = filament
@@ -296,6 +315,16 @@ class Driver(BaseDriver):
                 )
             )
             return dict(rows.all())
+
+    async def _assigned_elsewhere(self, spool_id: int, slot: int) -> bool:
+        """Whether FilaMan has the spool in another slot, on any printer."""
+        async with async_session_maker() as db:
+            rows = await db.execute(
+                select(PrinterSlot.printer_id, PrinterSlot.slot_no)
+                .join(PrinterSlotAssignment, PrinterSlotAssignment.slot_id == PrinterSlot.id)
+                .where(PrinterSlotAssignment.spool_id == spool_id)
+            )
+            return any(tuple(row) != (self.printer_id, slot) for row in rows.all())
 
     async def send_filament_to_tray(
         self,

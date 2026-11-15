@@ -11,6 +11,7 @@ A [FilaMan](https://github.com/Fire-Devils/filaman-system) printer driver for th
 - During a print, follows `box_extras.loaded_slot` and charges the net filament used to that slot's spool.
 - Releases a slot's spool after it has read empty for 30 seconds with no print running, so a swapped spool can't be charged for the old one's filament.
 - Restores that spool if the slot refills with the same filament, going by the colour, material and filament code on the printer. So an eject and reload needs no reassigning. If you select a different filament on the printer's screen within 10 minutes, the spool is released again.
+- Ignores the Box's filament details for a minute after the printer or Box powers up, because it first reports default filament for every slot.
 - Feeds FilaMan's AMS View with the Box's slots, temperature and humidity.
 
 ## How usage is counted
